@@ -7,14 +7,11 @@ from telegram.ext import (
     ApplicationBuilder, ContextTypes, CommandHandler,
     MessageHandler, CallbackQueryHandler, filters
 )
-
 from web3 import Web3
 
-# ---------- Logging ----------
 logger = logging.getLogger("slh.bot")
 logging.basicConfig(level=getattr(logging, os.environ.get("LOG_LEVEL","INFO"), logging.INFO))
 
-# ---------- Helpers ----------
 def _env(k: str, d: Optional[str] = None) -> Optional[str]:
     return os.environ.get(k, d)
 
@@ -62,7 +59,6 @@ def _get_w3_and_contract_for_tokenuri():
     c = w3.eth.contract(address=Web3.to_checksum_address(contract_addr), abi=abi)
     return w3, c
 
-# ---------- UI ----------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         kb = [
@@ -90,7 +86,6 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "buy_sela_nft":
             await mint_nft_start(update, context)
         elif data == "sell_wizard":
-            # placeholder / עתידי
             await q.message.reply_text("🔧 בקרוב: אשף הנפקה/מכירה.")
         elif data == "status":
             await q.message.reply_text("✅ הבוט פעיל. נסה/י /mint")
@@ -104,7 +99,6 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-# ---------- Mint Flow (ERC-721) ----------
 async def mint_nft_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["awaiting_wallet_for_mint_nft"] = True
     await (update.message or update.effective_message).reply_text(
@@ -204,7 +198,6 @@ def erc721_mint_from_treasury(to_addr: str) -> str:
         raise RuntimeError(f"tx failed: {tx_hash.hex()}")
     return tx_hash.hex()
 
-# ---------- Info Commands ----------
 async def cmd_tokenId(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tid = context.user_data.get("last_token_id")
     if tid is not None:
@@ -245,48 +238,32 @@ async def cmd_tokenURI(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("[tokenURI] failed: %s", e)
         await update.message.reply_text(f"שגיאה בקריאת tokenURI: {e}")
 
-# ---------- App wiring ----------
 def build_app():
     TOKEN = _get_required("TELEGRAM_BOT_TOKEN")
     app = ApplicationBuilder().token(TOKEN).build()
-
-    # Commands
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("mint", mint_nft_start))
     app.add_handler(CommandHandler("tokenId", cmd_tokenId))
     app.add_handler(CommandHandler("tokenURI", cmd_tokenURI))
-
-    # Callback buttons
     app.add_handler(CallbackQueryHandler(on_cb))
-
-    # Text collector (wallet)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, mint_nft_wallet_collector))
-
     return app
 
 async def _run_webhook(app):
-    public = _get_required("BOT_WEBHOOK_PUBLIC_BASE")  # e.g. https://slhbot-bot.up.railway.app
+    public = _get_required("BOT_WEBHOOK_PUBLIC_BASE")
     path   = _env("BOT_WEBHOOK_PATH", "/tg")
     secret = _get_required("BOT_WEBHOOK_SECRET")
     port   = int(_env("PORT", "8080"))
-
-    # Telegram will call: {public}{path}
-    await app.initialize()
-    await app.start()
+    await app.initialize(); await app.start()
     await app.updater.start_webhook(
-        listen="0.0.0.0",
-        port=port,
-        url_path=path.lstrip("/"),
-        secret_token=secret,
-        webhook_url=f"{public}{path}",
+        listen="0.0.0.0", port=port, url_path=path.lstrip("/"),
+        secret_token=secret, webhook_url=f"{public}{path}",
     )
     logger.info("[WEBHOOK] listening on %s%s", public, path)
-    await app.updater.idle()
-    await app.stop()
-    await app.shutdown()
+    await app.updater.idle(); await app.stop(); await app.shutdown()
 
 def main():
-    mode = _env("BOT_MODE", "webhook").lower()
+    mode = _env("BOT_MODE","webhook").lower()
     app = build_app()
     if mode == "polling":
         app.run_polling(close_loop=False)
