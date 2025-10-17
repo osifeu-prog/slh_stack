@@ -1,38 +1,34 @@
-# SLH Stack – Bot + API (Testnet)
+# SLH Stack – Testnet Pack (Railway-ready)
 
-Ready-to-run **Telegram admin bot** wired to your **FastAPI chain service**.
+This pack ships:
+- **API** (FastAPI) with `/healthz`, `/v1/chain/mint-demo`, `/v1/chain/grant-sela`
+- **BOT** (python-telegram-bot 20.x) ready for webhook with auto `setWebhook` on boot
+- `railway.toml` for two Railway services
+- `.env.example` for local runs
 
-## What’s inside
-- `bot/run_admin_bot.py` – Telegram bot (webhook-ready; auto-sets webhook on boot; logs status).
-- `requirements.txt` – dependencies.
-- `.env.example` – copy to `.env.secrets` (Railway) or export locally.
+## Deploy (Railway)
 
-## Railway – Services
-1. **API**: already deployed → `https://slhstack-production.up.railway.app` (health: `/healthz`).
-2. **BOT**: start command `python bot/run_admin_bot.py` with env from `.env.example`.
+1. Push to GitHub.
+2. Create service **api** and **bot** from this repo (Railway will read `railway.toml`).
+3. Set variables:
 
-## Env (bot minimal)
-```
-TELEGRAM_BOT_TOKEN=...
-SLH_API_BASE=https://slhstack-production.up.railway.app
-BOT_MODE=webhook
-BOT_WEBHOOK_PUBLIC_BASE=https://slhbot-bot.up.railway.app
-BOT_WEBHOOK_PATH=/tg
-BOT_WEBHOOK_SECRET=sela_secret_123
-BOT_PORT=8080
-ADMIN_IDS=224223270
-```
-The bot **auto calls deleteWebhook → setWebhook** on boot. If it fails, it **falls back to polling**.
+**API**
+- `BSC_RPC_URL=https://bsc-testnet-rpc.publicnode.com`
+- `NFT_CONTRACT=0x8AD1de67648dB44B1b1D0E3475485910CedDe90b`
+- `CHAIN_ID=97`
+- *(optional for real on-chain)* `TREASURY_PRIVATE_KEY=0x...`
 
-## Commands
-`/ping`, `/adm_help`, `/adm_status`, `/adm_setwebhook`, `/adm_echo <text>`,
-`/adm_sell <wallet> <ipfs://CID|https://...> [note...]`, `/adm_recent [N]`, `/adm_post_summary`.
+**BOT**
+- `TELEGRAM_BOT_TOKEN=...`
+- `SLH_API_BASE=https://<api>.up.railway.app`
+- `BOT_WEBHOOK_PUBLIC_BASE=https://<bot>.up.railway.app`
+- `BOT_WEBHOOK_PATH=/tg`
+- `BOT_WEBHOOK_SECRET=sela_secret_123`  (A-Z a-z 0-9 _ -)
+- `PORT=8080`
+- `ADMIN_IDS=224223270`
 
-## Local run
-```bash
-pip install -r requirements.txt
-export TELEGRAM_BOT_TOKEN=...
-export SLH_API_BASE=http://127.0.0.1:8000
-export BOT_MODE=polling
-python bot/run_admin_bot.py
-```
+## Verify
+
+- API: `GET https://<api>.up.railway.app/healthz` -> `{"ok":true,...}`
+- Bot: in Telegram -> `/adm_status`, `/adm_setwebhook`, `/ping`, `/adm_sell <wallet> ipfs://CID`
+
