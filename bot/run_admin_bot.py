@@ -81,6 +81,91 @@ SUMMARY_MD = (
     "• NFT: `0x8AD1de67648dB44B1b1D0E3475485910CedDe90b`\n"
     "• Example CID: `QmbsDJMcYvwu5NrnWFC9vieUTFuuAPRMNSjmrVmnm5bJeq`\n"
 )
+# ========= User mint command =========
+BSC_TESTNET_EXPLORER = "https://testnet.bscscan.com"
+
+def _tx_link(tx_hash: str) -> str:
+    tx = tx_hash.strip()
+    return f"{BSC_TESTNET_EXPLORER}/tx/{tx}" if tx and tx != "-" else "-"
+
+# זיכרון קצר למניעת ריצה כפולה לאותו משתמש בזמן קצר (בדיקות/דמו)
+_RECENT_MINTS = {}  # user_id -> timestamp
+
+async def user_mint(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    שימוש:
+      /mint 0xYourWallet
+    פעולות:
+      1) mint NFT עם tokenURI מה-DEFAULT_META_CID אם לא סופק URI אחר
+      2) grant SELA לפי SELA_AMOUNT
+    """
+    user_id = update.effective_user.id if update.effective_user else 0
+
+    # אנטי-ספאם קצר: לא לאפשר יותר מפעם ב-20 שניות לאותו יוזר
+    now = int(time.time())
+    last = _RECENT_MINTS.get(user_id, 0)
+    if now - last < 20:
+        await update.message.reply_text("חכה כמה שניות ונסה שוב…")
+        return
+    _RECENT_MINTS[user_id] = now
+
+    # פרסינג ארגומנטים
+    args = context.args
+    if not args:
+        await update.message.reply_text("שימוש: /mint <WALLET>\nלדוגמה: /mint 0x693d...f02")
+        return
+
+    wallet = args[0].strip()
+    # token_uri: אם תרצה בעתיד לאפשר גם CID/URL מצד המשתמש, אפשר לקרוא מ-args[1]
+    token_uri = f"ipfs://{DEFAULT_META_CID}" if DEFAULT_META_CID else None
+    if not token_uri:
+        await update.message.reply_text("חסר DEFAULT_META_CID בהגדרות השרת.")
+        return
+
+    # ולידציה בסיסית לכתובת (לא מחמירה, רק לצורך חוויית משתמש)
+    if not re.fullmatch(r"0x[a-fA-F0-9]{40}", wallet):
+        await update.message.reply_text("הארנק לא נראה תקין. ודא שהוא בפורמט 0x… (42 תווים).")
+        return
+
+    try:
+        # 1) mint
+        mint_res = await api_post("/v1/chain/mint-demo", {
+            "to_wallet": wallet,
+            "token_uri": token_uri
+        })
+        mint_tx = mint_res.get("tx") or mint_res.get("hash") or "-"
+
+        # 2) grant SELA
+        grant_res = await api_post("/v1/chain/grant-sela", {
+            "to_wallet": wallet,
+            "amount": str(SELA_AMOUNT)
+        })
+        sela_tx = grant_res.get("tx") or grant_res.get("hash") or "-"
+
+        # לוג פנימי + תשובה למשתמש
+        push_event({
+            "wallet": wallet,
+            "token_uri": token_uri,
+            "mint_tx": mint_tx,
+            "sela_tx": sela_tx,
+            "note": f"user:{user_id}"
+        })
+
+        msg = (
+            "🎉 *Mint + SELA Granted!*\n"
+            f"• Wallet: `{wallet}`\n"
+            f"• tokenURI: `{token_uri}`\n"
+            f"• Mint TX: `{mint_tx}`\n"
+            f"  ↪️ {_tx_link(mint_tx)}\n"
+            f"• SELA TX: `{sela_tx}`\n"
+            f"  ↪️ {_tx_link(sela_tx)}\n"
+        )
+        await update.message.reply_markdown(msg)
+
+    except httpx.HTTPError as e:
+        await update.message.reply_text(f"API error: {e}")
+    except Exception as e:
+        await update.message.reply_text(f"Unexpected: {e}")
 
 # ==================== Handlers ====================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
