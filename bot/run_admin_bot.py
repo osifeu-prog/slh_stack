@@ -187,19 +187,18 @@ def reset_wiz(user_id: int):
 # =========================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [
-        [InlineKeyboardButton("⚡ קנה/י SELA", callback_data="buy_sela"),
+        [InlineKeyboardButton("⚡ קנה/י SELA (NFT)", callback_data="buy_sela_nft"),
          InlineKeyboardButton("🚀 הנפקה/מכירה", callback_data="sell_wizard")],
         [InlineKeyboardButton("📊 סטטוס", callback_data="status"),
          InlineKeyboardButton("ℹ️ עזרה", callback_data="help")]
     ]
     text = (
         "ברוך/ה הבא/ה ל־<b>SLH Admin Bot</b> ✨\n"
-        "נהל/י הנפקות, מכירות וזרימות תשלום בלחיצה.\n\n"
+        "כאן מבצעים mint ל־NFT (ERC-721) בלחיצה.\n\n"
         "בחר/י פעולה:"
     )
     msg = update.message or update.effective_message
-    await msg.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
-async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await msg.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong ✅")
 
 async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -508,8 +507,8 @@ def build_app():
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_router))
     # generic fallback for anything else
     app.add_handler(CallbackQueryHandler(on_cb))
-    app.add_handler(CommandHandler('mint', mint_start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, mint_wallet_collector))
+    app.add_handler(CommandHandler('mint', mint_nft_start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, mint_nft_wallet_collector))
 
     return app
 
@@ -640,3 +639,73 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await adm_help(update, context)
     else:
         await q.message.reply_text("⌛ בקרוב…")
+
+def _env(k, d=None): return os.environ.get(k, d)
+def _get_required(k):
+    v = _env(k)
+    if not v: raise RuntimeError(f"Missing env: {k}")
+    return v
+
+def _erc721_mint_abi():
+    fn = os.environ.get("TOKEN_MINT_FN", "safeMint")
+    return [{
+        "inputs": [{"internalType":"address","name":"to","type":"address"}],
+        "name": fn,
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    }]
+
+async def mint_nft_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["awaiting_wallet_for_mint_nft"] = True
+    await (update.message or update.effective_message).reply_text(
+        "שלח/י כתובת ארנק BSC (0x…) לקבלת NFT (טסטנט)."
+    )
+
+async def mint_nft_wallet_collector(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("awaiting_wallet_for_mint_nft"):
+        return
+    addr = (update.message.text or "").strip()
+    if not addr.startswith("0x") or len(addr) != 42:
+        await update.message.reply_text("❗ כתובת לא תקינה. נא שלח/י כתובת בפורמט 0x...")
+        return
+    context.user_data["awaiting_wallet_for_mint_nft"] = False
+    await update.message.reply_text("⏳ מבצע mint ל-NFT על BSC Testnet…")
+
+    loop = asyncio.get_running_loop()
+    try:
+        tx_hash = await loop.run_in_executor(None, erc721_mint_from_treasury, addr)
+        await update.message.reply_text(f"✅ NFT הונפק!\nלכתובת: <code>{addr}</code>\nTx: <code>{tx_hash}</code>", parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await update.message.reply_text(f"❗ שגיאה בביצוע:\n{e}")
+
+def erc721_mint_from_treasury(to_addr: str) -> str:
+    rpc = _get_required("BSC_RPC_URL")
+    chain_id = int(_env("CHAIN_ID", "97"))
+    contract_addr = _get_required("TOKEN_CONTRACT")
+    pk = _get_required("TREASURY_PRIVATE_KEY")
+
+    w3 = Web3(Web3.HTTPProvider(rpc))
+    if not w3.is_connected(): raise RuntimeError("RPC לא זמין")
+    acct = w3.eth.account.from_key(pk)
+
+    abi = _erc721_mint_abi()
+    contract = w3.eth.contract(address=Web3.to_checksum_address(contract_addr), abi=abi)
+    fn_name = os.environ.get("TOKEN_MINT_FN", "safeMint")
+    fn = contract.get_function_by_name(fn_name)(Web3.to_checksum_address(to_addr))
+
+    nonce = w3.eth.get_transaction_count(acct.address)
+    tx = fn.build_transaction({
+        "from": acct.address,
+        "nonce": nonce,
+        "chainId": chain_id,
+        "gas": 200000,
+        "maxFeePerGas": w3.to_wei("2", "gwei"),
+        "maxPriorityFeePerGas": w3.to_wei("1", "gwei"),
+    })
+    signed = acct.sign_transaction(tx)
+    tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+    if receipt.status != 1:
+        raise RuntimeError(f"tx failed: {tx_hash.hex()}")
+    return tx_hash.hex()
