@@ -186,19 +186,25 @@ def reset_wiz(user_id: int):
 # Handlers
 # =========================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [
-        [InlineKeyboardButton("⚡ קנה/י SELA (NFT)", callback_data="buy_sela_nft"),
-         InlineKeyboardButton("🚀 הנפקה/מכירה", callback_data="sell_wizard")],
-        [InlineKeyboardButton("📊 סטטוס", callback_data="status"),
-         InlineKeyboardButton("ℹ️ עזרה", callback_data="help")]
-    ]
-    text = (
-        "ברוך/ה הבא/ה ל־<b>SLH Admin Bot</b> ✨\n"
-        "כאן מבצעים mint ל־NFT (ERC-721) בלחיצה.\n\n"
-        "בחר/י פעולה:"
-    )
-    msg = update.message or update.effective_message
-    await msg.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        kb = [
+            [InlineKeyboardButton("⚡ קנה/י SELA (NFT)", callback_data="buy_sela_nft"),
+             InlineKeyboardButton("🚀 הנפקה/מכירה", callback_data="sell_wizard")],
+            [InlineKeyboardButton("📊 סטטוס", callback_data="status"),
+             InlineKeyboardButton("ℹ️ עזרה", callback_data="help")]
+        ]
+        text = (
+            "ברוך/ה הבא/ה ל־<b>SLH Admin Bot</b> ✨\n"
+            "כאן מבצעים mint ל־NFT (ERC-721) בלחיצה.\n\n"
+            "בחר/י פעולה:"
+        )
+        msg = update.message or update.effective_message
+        await msg.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.exception("start_cmd failed: %s", e)
+        await (update.message or update.effective_message).reply_text(f"❗ שגיאה: {e}")
+
+async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong ✅")
 
 async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -496,7 +502,7 @@ def build_app():
 
     app.add_handler(CommandHandler("ping",  ping_cmd))
     app.add_handler(CommandHandler("health",  health_cmd))
-    app.add_handler(CommandHandler("mint",  mint_cmd))
+
     app.add_handler(CommandHandler("adm_help", adm_help))
     app.add_handler(CommandHandler("adm_status", adm_status))
     app.add_handler(CommandHandler("adm_setwebhook", adm_setwebhook))
@@ -505,9 +511,11 @@ def build_app():
     app.add_handler(CommandHandler("adm_echo", adm_echo))
     # wizard + fallback
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_router))
-    # generic fallback for anything else
+    # generic fallback for anything else
     app.add_handler(CallbackQueryHandler(on_cb))
     app.add_handler(CommandHandler('mint', mint_nft_start))
+    app.add_handler(CommandHandler('tokenId', cmd_tokenId))
+    app.add_handler(CommandHandler('tokenURI', cmd_tokenURI))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, mint_nft_wallet_collector))
 
     return app
@@ -670,31 +678,72 @@ async def mint_nft_wallet_collector(update: Update, context: ContextTypes.DEFAUL
         await update.message.reply_text("❗ כתובת לא תקינה. נא שלח/י כתובת בפורמט 0x...")
         return
     context.user_data["awaiting_wallet_for_mint_nft"] = False
+
+    logger.info("[MINT] start | to=%s", addr)
     await update.message.reply_text("⏳ מבצע mint ל-NFT על BSC Testnet…")
 
     loop = asyncio.get_running_loop()
     try:
         tx_hash = await loop.run_in_executor(None, erc721_mint_from_treasury, addr)
-        await update.message.reply_text(f"✅ NFT הונפק!\nלכתובת: <code>{addr}</code>\nTx: <code>{tx_hash}</code>", parse_mode=ParseMode.HTML)
+        context.user_data["last_mint_tx"] = tx_hash
+        logger.info("[MINT] sent | tx=%s", tx_hash)
+
+        # נסה להוציא tokenId מהקבלה
+        try:
+            rpc = _get_required("BSC_RPC_URL")
+            contract_addr = _get_required("NFT_CONTRACT")
+            w3 = Web3(Web3.HTTPProvider(rpc))
+            if w3.is_connected():
+                tid = _fetch_token_id_from_receipt(w3, contract_addr, tx_hash)
+                logger.info("[MINT] receipt parsed | tokenId=%s", tid)
+                if tid is not None:
+                    context.user_data["last_token_id"] = tid
+                    await update.message.reply_text(
+                        f"✅ NFT הונפק!\nTokenID: <code>{tid}</code>\nTx: <code>{tx_hash}</code>",
+                        parse_mode=ParseMode.HTML
+                    )
+                else:
+                    await update.message.reply_text(
+                        f"✅ NFT הונפק!\n(לא אותר tokenId מהקבלה)\nTx: <code>{tx_hash}</code>",
+                        parse_mode=ParseMode.HTML
+                    )
+            else:
+                logger.warning("[MINT] RPC not connected for receipt parse")
+                await update.message.reply_text(
+                    f"✅ NFT הונפק!\n(אין חיבור RPC לזיהוי tokenId כעת)\nTx: <code>{tx_hash}</code>",
+                    parse_mode=ParseMode.HTML
+                )
+        except Exception as ie:
+            logger.exception("[MINT] parse receipt failed: %s", ie)
+            await update.message.reply_text(
+                f"✅ NFT הונפק!\n(שחזור tokenId נדחה: {ie})\nTx: <code>{tx_hash}</code>",
+                parse_mode=ParseMode.HTML
+            )
     except Exception as e:
+        logger.exception("[MINT] failed: %s", e)
         await update.message.reply_text(f"❗ שגיאה בביצוע:\n{e}")
 
 def erc721_mint_from_treasury(to_addr: str) -> str:
     rpc = _get_required("BSC_RPC_URL")
     chain_id = int(_env("CHAIN_ID", "97"))
-    contract_addr = _get_required("TOKEN_CONTRACT")
+    contract_addr = _get_required("NFT_CONTRACT")
     pk = _get_required("TREASURY_PRIVATE_KEY")
 
+    logger.info("[TX] prepare | rpc=%s | chain_id=%s | contract=%s", rpc, chain_id, contract_addr)
     w3 = Web3(Web3.HTTPProvider(rpc))
-    if not w3.is_connected(): raise RuntimeError("RPC לא זמין")
+    if not w3.is_connected():
+        raise RuntimeError("RPC לא זמין")
+
     acct = w3.eth.account.from_key(pk)
+    logger.debug("[TX] from address=%s", acct.address)
 
     abi = _erc721_mint_abi()
     contract = w3.eth.contract(address=Web3.to_checksum_address(contract_addr), abi=abi)
-    fn_name = os.environ.get("TOKEN_MINT_FN", "safeMint")
-    fn = contract.get_function_by_name(fn_name)(Web3.to_checksum_address(to_addr))
+    fn = contract.get_function_by_name("safeMint")(Web3.to_checksum_address(to_addr))
 
     nonce = w3.eth.get_transaction_count(acct.address)
+    logger.debug("[TX] nonce=%s", nonce)
+
     tx = fn.build_transaction({
         "from": acct.address,
         "nonce": nonce,
@@ -703,9 +752,97 @@ def erc721_mint_from_treasury(to_addr: str) -> str:
         "maxFeePerGas": w3.to_wei("2", "gwei"),
         "maxPriorityFeePerGas": w3.to_wei("1", "gwei"),
     })
+    logger.debug("[TX] built | %s", json.dumps({k: (str(v) if hasattr(v,'hex') else v) for k,v in tx.items()}, ensure_ascii=False))
+
     signed = acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
+    logger.info("[TX] sent | hash=%s", tx_hash.hex())
+
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+    logger.info("[TX] mined | status=%s", getattr(receipt,'status',None))
     if receipt.status != 1:
         raise RuntimeError(f"tx failed: {tx_hash.hex()}")
     return tx_hash.hex()
+
+async def cmd_tokenId(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tid = context.user_data.get("last_token_id")
+    if tid is not None:
+        await update.message.reply_text(f"🔖 tokenId האחרון שלך: <code>{tid}</code>", parse_mode=ParseMode.HTML)
+        return
+    txh = context.user_data.get("last_mint_tx")
+    if not txh:
+        await update.message.reply_text("אין tokenId שמור עדיין. בצע/י mint קודם.")
+        return
+    try:
+        rpc = _get_required("BSC_RPC_URL")
+        contract_addr = _get_required("TOKEN_CONTRACT")
+        w3 = Web3(Web3.HTTPProvider(rpc))
+        if not w3.is_connected():
+            await update.message.reply_text("RPC לא זמין כרגע לשחזור tokenId.")
+            return
+        tid = _fetch_token_id_from_receipt(w3, contract_addr, txh)
+        if tid is None:
+            await update.message.reply_text("לא אותר tokenId מהקבלה. ייתכן והחוזה לא סטנדרטי או שהאירוע שונה.")
+            return
+        context.user_data["last_token_id"] = tid
+        await update.message.reply_text(f"🔖 tokenId האחרון שלך: <code>{tid}</code>", parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await update.message.reply_text(f"שגיאה בשחזור tokenId: {e}")
+
+async def cmd_tokenURI(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tid = context.user_data.get("last_token_id")
+    if tid is None:
+        await update.message.reply_text("אין tokenId שמור. הרץ/י /tokenId קודם, או בצע/י mint.")
+        return
+    try:
+        w3, c = _get_w3_and_contract_for_tokenuri()
+        fn_name = os.environ.get("TOKEN_URI_FN", "tokenURI")
+        fn = c.get_function_by_name(fn_name)(tid)
+        uri = fn.call()
+        await update.message.reply_text(f"🔗 tokenURI:\n<code>{uri}</code>", parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await update.message.reply_text(f"שגיאה בקריאת tokenURI: {e}")
+
+def _env(k, d=None): return os.environ.get(k, d)
+def _get_required(k):
+    v = _env(k)
+    if not v: raise RuntimeError(f"Missing env: {k}")
+    return v
+
+def _erc721_mint_abi():
+    # safeMint(address to)
+    return [{
+        "inputs": [{"internalType":"address","name":"to","type":"address"}],
+        "name": "safeMint",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    }]
+
+def _erc721_tokenuri_abi():
+    # tokenURI(uint256) -> string
+    return [{
+        "inputs": [{"internalType":"uint256","name":"tokenId","type":"uint256"}],
+        "name": "tokenURI",
+        "outputs": [{"internalType":"string","name":"","type":"string"}],
+        "stateMutability": "view",
+        "type": "function"
+    }]
+
+def _fetch_token_id_from_receipt(w3: Web3, contract_address: str, tx_hash_hex: str):
+    sig = Web3.keccak(text="Transfer(address,address,uint256)").hex()
+    receipt = w3.eth.get_transaction_receipt(tx_hash_hex)
+    for lg in receipt.logs:
+        if lg["address"].lower() == Web3.to_checksum_address(contract_address).lower() and lg["topics"][0].hex().lower() == sig.lower():
+            if len(lg["topics"]) >= 4:
+                return int(lg["topics"][3].hex(), 16)
+    return None
+
+def _get_w3_and_contract_for_tokenuri():
+    rpc = _get_required("BSC_RPC_URL")
+    contract_addr = _get_required("NFT_CONTRACT")
+    w3 = Web3(Web3.HTTPProvider(rpc))
+    if not w3.is_connected(): raise RuntimeError("RPC לא זמין")
+    abi = _erc721_tokenuri_abi()
+    c = w3.eth.contract(address=Web3.to_checksum_address(contract_addr), abi=abi)
+    return w3, c
