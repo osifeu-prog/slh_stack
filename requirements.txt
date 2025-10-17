@@ -1,7 +1,7 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 python-telegram-bot[webhooks]==20.8
-httpx==0.27.2
+httpx==0.26.0
 web3==6.20.3
 setuptools>=68.0.0
 wheel>=0.41.2
