@@ -1,199 +1,213 @@
-# -*- coding: utf-8 -*-
-"""
-SLH Admin Bot — Railway-ready
-- Webhook first (https only), falls back to polling אוטומטית כשצריך
-- לוגים קריאים + הדפסות דיבאג ידידותיות
-- פקודות בסיס: /start /ping /adm_help /adm_status /adm_setwebhook /adm_echo
-- דרישות: python-telegram-bot>=21  (ול־webhooks: pip install "python-telegram-bot[webhooks]")
-"""
-
-import os
-import sys
-import asyncio
-import logging
-from typing import Optional
+import os, sys, json, logging, asyncio, time, re
+from typing import List
+import httpx
 
 from telegram import Update
-from telegram.ext import (
-    Application, ApplicationBuilder, CommandHandler,
-    MessageHandler, ContextTypes, filters
-)
-from telegram.error import BadRequest
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
-# ---------- Logging ----------
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+# ===== Env =====
+TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN","").strip()
+API     = os.getenv("SLH_API_BASE","http://127.0.0.1:8000").rstrip("/")
+ADMINS  = [int(x) for x in os.getenv("ADMIN_IDS","").split(",") if x.strip().isdigit()]
+MODE    = os.getenv("BOT_MODE","webhook").lower().strip()  # webhook | polling
+PUBLIC  = os.getenv("BOT_WEBHOOK_PUBLIC_BASE","").rstrip("/")
+PATH    = os.getenv("BOT_WEBHOOK_PATH","/tg")
+SECRET  = os.getenv("BOT_WEBHOOK_SECRET","sela_secret_123")
+PORT    = int(os.getenv("BOT_PORT","8081"))
+
+DEFAULT_WALLET   = os.getenv("DEFAULT_WALLET","").strip()
+DEFAULT_META_CID = os.getenv("DEFAULT_META_CID","").strip()
+SELA_AMOUNT      = os.getenv("SELA_AMOUNT","0.15984").strip()
+
+if not TOKEN:
+    print("TELEGRAM_BOT_TOKEN missing"); sys.exit(1)
+
+# allowed chars for secret (Telegram restriction)
+if not re.fullmatch(r"[A-Za-z0-9_\-]+", SECRET):
+    print("BOT_WEBHOOK_SECRET must contain only letters/digits/_/-")
+    sys.exit(1)
+
+# ===== Logging =====
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    datefmt="%H:%M:%S",
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s | %(message)s"
 )
-# הפחתת רעש ספריות רשת
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logger = logging.getLogger("slh.bot")
+log = logging.getLogger("slh.bot")
 
-# ---------- ENV ----------
-TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-API     = os.getenv("SLH_API_BASE", "").rstrip("/")
-MODE    = os.getenv("BOT_MODE", "webhook").strip().lower()     # webhook | polling
-PUBLIC  = os.getenv("BOT_WEBHOOK_PUBLIC_BASE", "").strip().rstrip("/")  # https://your-domain
-PATH    = os.getenv("BOT_WEBHOOK_PATH", "/tg").strip()
-SECRET  = os.getenv("BOT_WEBHOOK_SECRET", "sela_secret").strip()
+# ===== helpers =====
+def is_admin(user_id:int) -> bool:
+    return (user_id in ADMINS) if ADMINS else True  # if unset, allow for dev
 
-# Railway exposes PORT; אם לא — קח BOT_PORT; אחרת 8081
-_port_env = os.getenv("PORT") or os.getenv("BOT_PORT") or "8081"
-try:
-    PORT = int(_port_env)
-except ValueError:
-    logger.warning("BOT_PORT/PORT invalid (%s). Using 8081.", _port_env)
-    PORT = 8081
+async def api_post(path:str, payload:dict):
+    url = f"{API}{path}"
+    timeout = httpx.Timeout(20, connect=10)
+    async with httpx.AsyncClient(timeout=timeout) as cx:
+        r = await cx.post(url, json=payload)
+        r.raise_for_status()
+        return r.json()
 
-# Railway לפעמים חושף דומיין ציבורי במשתנה סביבה:
-RAILWAY_PUBLIC_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
-if not PUBLIC and RAILWAY_PUBLIC_DOMAIN:
-    PUBLIC = f"https://{RAILWAY_PUBLIC_DOMAIN}"
-    logger.info("BOT_WEBHOOK_PUBLIC_BASE not set, derived from RAILWAY_PUBLIC_DOMAIN=%s", PUBLIC)
+# simple in-process log (append only); replace with DB later
+EVENTS: List[dict] = []
 
-def _mode_summary() -> str:
-    return (
-        f"MODE={MODE} | PORT={PORT} | PUBLIC='{PUBLIC or '-'}' "
-        f"| PATH='{PATH}' | SECRET.len={len(SECRET)} | API='{API or '-'}'"
-    )
+def push_event(ev:dict):
+    ev = dict({"ts": int(time.time())}, **ev)
+    EVENTS.append(ev)
+    if len(EVENTS) > 500:  # cap
+        del EVENTS[:200]
 
-# ---------- Handlers ----------
+SUMMARY_MD = (
+    "*SLH – Go-Live Pack (Testnet)*\n\n"
+    "*0) Quick Ref*\n"
+    "• Network: BSC Testnet (97)\n"
+    "• NFT: `0x8AD1de67648dB44B1b1D0E3475485910CedDe90b`\n"
+    "• Example CID: `QmbsDJMcYvwu5NrnWFC9vieUTFuuAPRMNSjmrVmnm5bJeq`\n"
+)
 
+# ===== Handlers =====
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     who = update.effective_user
     await update.message.reply_text(
-        f"שלום {who.first_name or ''}! הבוט באוויר ✅\n"
-        f"נסה /ping או /adm_help"
+        f"שלום {who.first_name or ''}! הבוט באוויר ✅  | נסה /ping או /adm_help"
     )
 
 async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("pong ✅")
+    await update.message.reply_text("pong")
 
 async def adm_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "פקודות אדמין שימושיות:\n"
-        "/adm_status — מצב ריצה והגדרות\n"
-        "/adm_setwebhook — קובע webhook לפי ההגדרות הנוכחיות\n"
-        "/adm_echo <טקסט> — החזר טקסט (בדיקה)\n"
-        "/ping — בדיקת חיים\n"
-    )
-    await update.message.reply_text(text)
-
-async def adm_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Status:\n```\n" + _mode_summary() + "\n```",
-        parse_mode="Markdown"
-    )
-
-async def adm_setwebhook(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """מגדיר מחדש webhook לפי ה־env הנוכחיים. שימושי אחרי שינוי דומיין."""
-    if not PUBLIC.startswith("https://"):
-        await update.message.reply_text("❌ PUBLIC URL חייב להיות https. קבע BOT_WEBHOOK_PUBLIC_BASE=HTTPS…")
+    if not is_admin(update.effective_user.id):
         return
-    url = f"{PUBLIC}{PATH}"
+    txt = (
+        "*Admin commands:*\n"
+        "/adm_sell `<wallet>` `<ipfs://CID|https://...>` `[note...]`\n"
+        "/adm_recent `[N]` – show last events\n"
+        "/adm_post_summary – post go-live card\n"
+        "/ping – health check\n"
+    )
+    await update.message.reply_markdown(txt)
+
+async def adm_post_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    await update.message.reply_markdown(SUMMARY_MD)
+
+async def adm_recent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    n = 20
+    if context.args and context.args[0].isdigit():
+        n = min(int(context.args[0]), 100)
+    lines = []
+    for ev in EVENTS[-n:]:
+        lines.append(
+            f"ts={ev.get('ts')} | wallet={ev.get('wallet','-')} | tokenURI={ev.get('token_uri','-')}\n"
+            f"mint={ev.get('mint_tx','-')} | sela={ev.get('sela_tx','-')} | note={ev.get('note','-')}"
+        )
+    if not lines:
+        await update.message.reply_text("No events yet.")
+    else:
+        await update.message.reply_text("```\n" + "\n\n".join(lines) + "\n```", parse_mode="Markdown")
+
+async def adm_sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text("Usage: /adm_sell <wallet> <ipfs://CID|https://...> [note...]")
+        return
+    wallet = args[0].strip()
+    uri_in  = args[1].strip()
+    note = " ".join(args[2:]).strip() if len(args) > 2 else ""
+
+    # normalize token_uri
+    if uri_in.startswith("ipfs://"):
+        token_uri = uri_in
+    elif re.match(r"^Qm[1-9A-Za-z]{44,}", uri_in):  # raw CID
+        token_uri = f"ipfs://{uri_in}"
+    else:
+        token_uri = uri_in  # allow https
+
     try:
-        ok = await context.bot.set_webhook(url=url, secret_token=SECRET)
-    except BadRequest as e:
-        await update.message.reply_text(f"❌ Telegram error: {e.message}")
-        return
-    await update.message.reply_text(f"SetWebhook → {ok}\n{url}")
+        # 1) Mint
+        mint_res = await api_post("/v1/chain/mint-demo", {
+            "to_wallet": wallet,
+            "token_uri": token_uri
+        })
+        mint_tx = mint_res.get("tx") or mint_res.get("hash") or "-"
 
-async def adm_echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = " ".join(context.args) if context.args else "(no text)"
-    await update.message.reply_text(f"echo: {msg}")
+        # 2) Grant SELA
+        sela_amt = SELA_AMOUNT
+        grant_res = await api_post("/v1/chain/grant-sela", {
+            "to_wallet": wallet,
+            "amount": str(sela_amt)
+        })
+        sela_tx = grant_res.get("tx") or grant_res.get("hash") or "-"
 
-async def fallback_logger(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """לוג כללי לכל מה שלא נתפס; עוזר בדיבאג."""
-    chat_id = update.effective_chat.id if update.effective_chat else None
-    user_id = update.effective_user.id if update.effective_user else None
-    txt = update.message.text if update.message else "<no text>"
-    logger.info("[UPDATE] chat=%s user=%s text=%s", chat_id, user_id, txt)
+        push_event({
+            "wallet": wallet,
+            "token_uri": token_uri,
+            "mint_tx": mint_tx,
+            "sela_tx": sela_tx,
+            "note": note
+        })
 
-# ---------- App builder ----------
+        msg = (
+            "✅ *Sold + Granted*\n"
+            f"• Wallet: `{wallet}`\n"
+            f"• tokenURI: `{token_uri}`\n"
+            f"• Mint TX: `{mint_tx}`\n"
+            f"• SELA TX: `{sela_tx}`\n"
+        )
+        await update.message.reply_markdown(msg)
 
-def build_app() -> Application:
-    if not TOKEN:
-        logger.error("TELEGRAM_BOT_TOKEN missing")
-        sys.exit(1)
+    except httpx.HTTPError as e:
+        await update.message.reply_text(f"API error: {e}")
+    except Exception as e:
+        await update.message.reply_text(f"Unexpected: {e}")
 
+async def echo_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = update.message.text if update.message else ""
+    if txt.startswith("/"):
+        await update.message.reply_text("Unknown command. Try /adm_help")
+    else:
+        if update.effective_chat and str(update.effective_chat.type) == "ChatType.PRIVATE":
+            await update.message.reply_text("Hi! Use /adm_help")
+
+def build_app():
     app = ApplicationBuilder().token(TOKEN).build()
-
     app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("ping", ping_cmd))
+    app.add_handler(CommandHandler("ping",  ping_cmd))
     app.add_handler(CommandHandler("adm_help", adm_help))
-    app.add_handler(CommandHandler("adm_status", adm_status))
-    app.add_handler(CommandHandler("adm_setwebhook", adm_setwebhook))
-    app.add_handler(CommandHandler("adm_echo", adm_echo))
-    app.add_handler(MessageHandler(filters.ALL, fallback_logger))
-
+    app.add_handler(CommandHandler("adm_post_summary", adm_post_summary))
+    app.add_handler(CommandHandler("adm_recent", adm_recent))
+    app.add_handler(CommandHandler("adm_sell", adm_sell))
+    app.add_handler(MessageHandler(filters.ALL, echo_fallback))
     return app
 
-# ---------- Runners ----------
+def run_polling(app):
+    log.info("Starting bot in POLLING mode…")
+    app.run_polling(close_loop=False)
 
-async def run_polling(app: Application):
-    logger.warning("Running in POLLING mode. " + _mode_summary())
-    await app.initialize()
-    try:
-        await app.start()
-        await app.updater.start_polling(drop_pending_updates=True)
-        logger.info("Polling started ✅")
-        # רץ עד Ctrl+C
-        await asyncio.Event().wait()
-    finally:
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
-
-async def run_webhook(app: Application):
+def run_webhook(app):
     if not PUBLIC.startswith("https://"):
-        logger.error("BOT_WEBHOOK_PUBLIC_BASE must be https for webhook mode")
+        print("BOT_WEBHOOK_PUBLIC_BASE must be https for webhook mode")
         sys.exit(1)
-
-    url = f"{PUBLIC}{PATH}"
-    logger.info("Starting WEBHOOK. " + _mode_summary())
-    await app.initialize()
-    try:
-        # קובע webhook בטלגרם עם secret
-        await app.bot.set_webhook(url=url, secret_token=SECRET)
-        logger.info("Webhook set ✅ %s", url)
-
-        await app.start()
-        # מאזין HTTP פנימי על ה־PORT שריילוואי פותח לנו
-        await app.updater.start_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path=PATH,
-            webhook_url=url,
-            secret_token=SECRET,
-            drop_pending_updates=True,
-        )
-        logger.info("Webhook listener up on port %s ✅", PORT)
-        await asyncio.Event().wait()
-    except BadRequest as e:
-        logger.error("Telegram BadRequest: %s", e)
-        raise
-    finally:
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
-
-def main():
-    logger.info("Booting Admin bot…")
-    app = build_app()
-
-    if MODE == "webhook":
-        try:
-            asyncio.run(run_webhook(app))
-        except SystemExit:
-            raise
-        except Exception:
-            # נפילה בוובהוק? ננסה polling כדי שלא תישאר בלי בוט בזמן דיבאג.
-            logger.exception("Webhook failed — falling back to POLLING.")
-            asyncio.run(run_polling(app))
-    else:
-        asyncio.run(run_polling(app))
+    url = PUBLIC + PATH
+    log.info(f"Starting bot in WEBHOOK mode at {url} (port {PORT})")
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        webhook_url=url,
+        secret_token=SECRET,
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+        close_loop=False,
+        cert=None, key=None
+    )
 
 if __name__ == "__main__":
-    main()
+    print(f"🚀 Admin bot is starting ({MODE})…")
+    app = build_app()
+    if MODE == "polling":
+        run_polling(app)
+    else:
+        run_webhook(app)
