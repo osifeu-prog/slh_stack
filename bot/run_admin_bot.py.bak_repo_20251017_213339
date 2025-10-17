@@ -1,8 +1,3 @@
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ParseMode
-from telegram.ext import CallbackQueryHandler, MessageHandler, filters
-from web3 import Web3
-import os, asyncio
 # -*- coding: utf-8 -*-
 import os, sys, json, logging, asyncio, time, re, pathlib, io
 from typing import List, Dict, Tuple, Optional
@@ -186,19 +181,17 @@ def reset_wiz(user_id: int):
 # Handlers
 # =========================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [
-        [InlineKeyboardButton("⚡ קנה/י SELA", callback_data="buy_sela"),
-         InlineKeyboardButton("🚀 הנפקה/מכירה", callback_data="sell_wizard")],
-        [InlineKeyboardButton("📊 סטטוס", callback_data="status"),
-         InlineKeyboardButton("ℹ️ עזרה", callback_data="help")]
-    ]
-    text = (
-        "ברוך/ה הבא/ה ל־<b>SLH Admin Bot</b> ✨\n"
-        "נהל/י הנפקות, מכירות וזרימות תשלום בלחיצה.\n\n"
-        "בחר/י פעולה:"
+    who = update.effective_user
+    msg = (
+        f"שלום {who.first_name or ''}! הבוט באוויר ✅\n"
+        "נסה /ping או /adm_help\n\n"
+        "למשתתפים:\n"
+        f"שלחו: `/mint <כתובת־ארנק>` כדי לקבל NFT (CID ברירת מחדל) + SELA {SELA_AMOUNT}\n"
+        "דוגמה:\n"
+        "`/mint 0x1234...abcd`\n"
     )
-    msg = update.message or update.effective_message
-    await msg.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
 async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong ✅")
 
@@ -494,8 +487,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 def build_app():
     app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CallbackQueryHandler(on_cb))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, mint_wallet_collector)))
+    app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("ping",  ping_cmd))
     app.add_handler(CommandHandler("health",  health_cmd))
     app.add_handler(CommandHandler("mint",  mint_cmd))
@@ -557,84 +549,3 @@ if __name__ == "__main__":
         # ⛑️ safety net — אם יש בעיית לולאה, עבור לפולינג כדי לא לאבד זמינות
         log.error(f"Webhook failed ({e}). Falling back to POLLING mode…")
         run_polling(app)
-
-ERC20_ABI = [
-    {"constant": False, "inputs": [{"name": "to", "type": "address"}, {"name": "value", "type": "uint256"}], "name": "transfer", "outputs": [{"name":"","type":"bool"}], "type": "function"},
-    {"constant": True,  "inputs": [], "name": "decimals", "outputs": [{"name":"","type":"uint8"}], "type": "function"},
-    {"constant": True,  "inputs": [], "name": "symbol", "outputs": [{"name":"","type":"string"}], "type": "function"},
-]
-def _env(k, d=None): return os.environ.get(k, d)
-def _get_required(k):
-    v = _env(k)
-    if not v: raise RuntimeError(f"Missing env: {k}")
-    return v
-
-async def mint_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["awaiting_wallet_for_mint"] = True
-    await (update.message or update.effective_message).reply_text(
-        "שלח/י כתובת ארנק BSC (0x…) לקבלת SELA (טסטנט)."
-    )
-
-async def mint_wallet_collector(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("awaiting_wallet_for_mint"):
-        return
-    addr = (update.message.text or "").strip()
-    if not addr.startswith("0x") or len(addr) != 42:
-        await update.message.reply_text("❗ כתובת לא תקינה. נא שלח/י כתובת בפורמט 0x...")
-        return
-    context.user_data["awaiting_wallet_for_mint"] = False
-    await update.message.reply_text("⏳ מבצע טרנזקציה על BSC Testnet…")
-
-    loop = asyncio.get_running_loop()
-    try:
-        tx_hash, symbol, amount = await loop.run_in_executor(None, erc20_transfer_from_treasury, addr)
-        await update.message.reply_text(f"✅ נשלח {amount} {symbol} לכתובת:\n<code>{addr}</code>\nTx: <code>{tx_hash}</code>", parse_mode=ParseMode.HTML)
-    except Exception as e:
-        await update.message.reply_text(f"❗ שגיאה בביצוע:\n{e}")
-
-def erc20_transfer_from_treasury(to_addr: str):
-    rpc = _get_required("BSC_RPC_URL")
-    chain_id = int(_env("CHAIN_ID", "97"))
-    contract_addr = _get_required("TOKEN_CONTRACT")
-    pk = _get_required("TREASURY_PRIVATE_KEY")
-    amount_str = _get_required("SELA_AMOUNT")
-
-    w3 = Web3(Web3.HTTPProvider(rpc))
-    if not w3.is_connected(): raise RuntimeError("RPC לא זמין")
-    acct = w3.eth.account.from_key(pk)
-    contract = w3.eth.contract(address=Web3.to_checksum_address(contract_addr), abi=ERC20_ABI)
-
-    decimals = contract.functions.decimals().call()
-    symbol = contract.functions.symbol().call()
-    value = int(float(amount_str) * (10 ** decimals))
-
-    nonce = w3.eth.get_transaction_count(acct.address)
-    tx = contract.functions.transfer(Web3.to_checksum_address(to_addr), value).build_transaction({
-        "from": acct.address,
-        "nonce": nonce,
-        "chainId": chain_id,
-        "gas": 100000,
-        "maxFeePerGas": w3.to_wei("2", "gwei"),
-        "maxPriorityFeePerGas": w3.to_wei("1", "gwei"),
-    })
-    signed = acct.sign_transaction(tx)
-    tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-    if receipt.status != 1:
-        raise RuntimeError(f"tx failed: {tx_hash.hex()}")
-    return (tx_hash.hex(), symbol, amount_str)
-
-async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    data = (q.data or "").strip()
-    await q.answer()
-    if data == "buy_sela":
-        await mint_start(update, context)
-    elif data == "sell_wizard":
-        await adm_sell(update, context)
-    elif data == "status":
-        await adm_status(update, context)
-    elif data == "help":
-        await adm_help(update, context)
-    else:
-        await q.message.reply_text("⌛ בקרוב…")
