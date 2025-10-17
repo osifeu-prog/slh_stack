@@ -8,21 +8,20 @@
   - \BOT_WEBHOOK_PUBLIC_BASE=https://slhbot-bot.up.railway.app\  (ללא '/' בסוף)
   - \BOT_WEBHOOK_PATH=/tg\
   - \BOT_WEBHOOK_SECRET=<סוד>\
-  - \TELEGRAM_BOT_TOKEN=<טוקן הבוט>\
+  - \TELEGRAM_BOT_TOKEN=<טוקן מה@BotFather>\
+  - \BSC_RPC_URL\, \CHAIN_ID=97\, \TOKEN_CONTRACT\, \TREASURY_PRIVATE_KEY\, \SELA_AMOUNT=0.15984\
 - אין \BOT_PORT\.
 
 ### 2) slh_API
 - Start: \uvicorn slh.api:app --host 0.0.0.0 --port \
-- אין בו /tg ולא משתני הבוט.
+- לשים ENV רלוונטיים ל-API בלבד.
 
-## .env.example
-שכפל לקובץ \.env\ בסביבת פיתוח, או הגדר את המשתנים ישירות ב-Railway.
+## פיצ'רים בקוד
+- \/start\ עם כפתורים בעברית (RTL).
+- כפתור **⚡ קנה/י SELA** מחובר לזרימת \/mint\ (ERC-20 על BSC Testnet).
+- רישום הנדלרים: \CallbackQueryHandler\, \CommandHandler('mint', ...)\, \MessageHandler(... mint_wallet_collector)\.
+- \equirements.txt\ כולל \web3\.
 
-## פיצ'רים שנוספו
-- /start עם כפתורי RTL.
-- ⚡ "קנה/י SELA" → זרימת \/mint\ (ERC-20, BSC Testnet).
-- דרישת \web3\ ב-requirements.
-
-## הערות אבטחה
+## אבטחה
 - אל תדחוף \.env\ לריפו.
-- המפתח הפרטי \TREASURY_PRIVATE_KEY\ נשאר רק ב-Railway ENV.
+- שמור \TREASURY_PRIVATE_KEY\ ויתר סודות רק ב-ENV של Railway.

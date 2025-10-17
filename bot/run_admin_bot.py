@@ -494,8 +494,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 def build_app():
     app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CallbackQueryHandler(on_cb))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, mint_wallet_collector)))
+
     app.add_handler(CommandHandler("ping",  ping_cmd))
     app.add_handler(CommandHandler("health",  health_cmd))
     app.add_handler(CommandHandler("mint",  mint_cmd))
@@ -507,8 +506,11 @@ def build_app():
     app.add_handler(CommandHandler("adm_echo", adm_echo))
     # wizard + fallback
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_router))
-    # generic fallback for anything else
-    app.add_handler(MessageHandler(filters.ALL, lambda *_: None))
+    # generic fallback for anything else
+    app.add_handler(CallbackQueryHandler(on_cb))
+    app.add_handler(CommandHandler('mint', mint_start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, mint_wallet_collector))
+
     return app
 
 def run_polling(app):
