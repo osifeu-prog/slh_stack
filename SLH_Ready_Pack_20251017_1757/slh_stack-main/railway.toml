@@ -1,0 +1,29 @@
+[project]
+name = "slh_stack"
+
+[services.api]
+start = "uvicorn run_api:app --host 0.0.0.0 --port $PORT"
+env = "production"
+rootDir = "."
+restartPolicyType = "ON_FAILURE"
+
+  [services.api.vars]
+  PORT = "8080"
+  BSC_RPC_URL = "https://bsc-testnet-rpc.publicnode.com"
+  NFT_CONTRACT = "0x8AD1de67648dB44B1b1D0E3475485910CedDe90b"
+  CHAIN_ID = "97"
+  DEFAULT_WALLET = "0x693db6c817083818696a7228aEbfBd0Cd3371f02"
+  DEFAULT_META_CID = "QmbsDJMcYvwu5NrnWFC9vieUTFuuAPRMNSjmrVmnm5bJeq"
+  SELA_AMOUNT = "0.15984"
+
+[services.bot]
+start = "python bot/run_admin_bot.py"
+env = "production"
+rootDir = "."
+restartPolicyType = "ON_FAILURE"
+
+  [services.bot.vars]
+  PORT = "8080"
+  BOT_MODE = "webhook"
+  BOT_WEBHOOK_PATH = "/tg"
+  # TELEGRAM_BOT_TOKEN, SLH_API_BASE, BOT_WEBHOOK_PUBLIC_BASE, BOT_WEBHOOK_SECRET -> set in Railway UI
