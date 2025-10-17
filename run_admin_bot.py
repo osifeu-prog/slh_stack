@@ -1,0 +1,868 @@
+logger = logging.getLogger('slh.bot')
+logging.basicConfig(level=getattr(logging, os.environ.get('LOG_LEVEL','INFO'), logging.INFO))
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
+from telegram.ext import ApplicationBuilder, CallbackQueryHandler, MessageHandler, filters, CommandHandler
+from web3 import Web3
+import os, asyncio, logging, json
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
+
+    foreach($p in @('CallbackQueryHandler','MessageHandler','CommandHandler','filters')){
+      if ($parts -notcontains $p){ $parts += $p }
+    }
+  
+from web3 import Web3
+import os, asyncio
+# -*- coding: utf-8 -*-
+import os, sys, json, logging, asyncio, time, re, pathlib, io
+from typing import List, Dict, Tuple, Optional
+import httpx
+
+from telegram import Update
+from telegram.constants import ParseMode
+
+    foreach($p in @('CallbackQueryHandler','MessageHandler','CommandHandler','filters')){
+      if ($parts -notcontains $p){ $parts += $p }
+    }
+  
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+
+# =========================
+# Environment & Defaults
+# =========================
+TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN","").strip()
+API     = os.getenv("SLH_API_BASE","http://127.0.0.1:8000").rstrip("/")
+MODE    = os.getenv("BOT_MODE","webhook").lower().strip()  # webhook | polling
+PUBLIC  = os.getenv("BOT_WEBHOOK_PUBLIC_BASE","").rstrip("/")
+PATH    = os.getenv("BOT_WEBHOOK_PATH","/tg")
+SECRET  = os.getenv("BOT_WEBHOOK_SECRET","sela_secret_123")
+PORT    = int(os.getenv("BOT_PORT", os.getenv("PORT","8080")))
+ADMINS  = [int(x) for x in os.getenv("ADMIN_IDS","").split(",") if x.strip().isdigit()]
+
+DEFAULT_WALLET   = os.getenv("DEFAULT_WALLET","").strip()
+DEFAULT_META_CID = os.getenv("DEFAULT_META_CID","").strip()  # e.g. Qm....
+SELA_AMOUNT      = os.getenv("SELA_AMOUNT","0.15984").strip()
+
+LOG_DIR          = os.getenv("BOT_LOG_DIR", "/app/botdata/logs").strip()
+
+if not TOKEN:
+    print("TELEGRAM_BOT_TOKEN missing"); sys.exit(1)
+
+# Telegram restriction for secret token (letters/digits/_/- only)
+if not re.fullmatch(r"[A-Za-z0-9_\-]+", SECRET):
+    print("BOT_WEBHOOK_SECRET must contain only letters/digits/_/-")
+    sys.exit(1)
+
+# =========================
+# Logging
+# =========================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s | %(message)s"
+)
+log = logging.getLogger("slh.bot")
+
+# Create log dir
+try:
+    pathlib.Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
+except Exception as e:
+    log.error(f"Failed creating LOG_DIR={LOG_DIR}: {e}")
+
+RUN_TS = int(time.time())
+RUN_ID = time.strftime("%Y%m%d-%H%M%S", time.gmtime(RUN_TS))
+SESSION_LOG_FILE = os.path.join(LOG_DIR, f"session-{RUN_ID}.log")
+
+def write_log_line(line: str):
+    try:
+        with open(SESSION_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line.rstrip() + "\n")
+    except Exception as e:
+        log.error(f"write_log_line failed: {e}")
+
+# =========================
+# Helpers: Admin, API calls
+# =========================
+def is_admin(user_id: int) -> bool:
+    # אם לא הוגדרו אדמינים — נניח מצב פיתוח (לא מומלץ בפרודקשן)
+    return (user_id in ADMINS) if ADMINS else True
+
+def _mask_token(t: str) -> str:
+    if len(t) < 8:
+        return "****"
+    return f"{t[:6]}...{t[-6:]}"
+
+async def api_get(path: str, params: dict | None = None):
+    url = f"{API}{path}"
+    timeout = httpx.Timeout(20, connect=10)
+    async with httpx.AsyncClient(timeout=timeout) as cx:
+        r = await cx.get(url, params=params)
+        r.raise_for_status()
+        return r.json()
+
+async def api_post(path: str, payload: dict):
+    url = f"{API}{path}"
+    timeout = httpx.Timeout(30, connect=12)
+    async with httpx.AsyncClient(timeout=timeout) as cx:
+        r = await cx.post(url, json=payload)
+        r.raise_for_status()
+        return r.json()
+
+# =========================
+# In-memory events + file
+# =========================
+EVENTS: List[dict] = []
+
+def push_event(ev: dict):
+    ev = dict({"ts": int(time.time())}, **ev)
+    EVENTS.append(ev)
+    if len(EVENTS) > 800:
+        del EVENTS[:300]
+    # write to file (append)
+    write_log_line(json.dumps(ev, ensure_ascii=False))
+
+def block_header(title: str) -> str:
+    return f"===== {title} | {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())} ====="
+
+# =========================
+# On-boot summary for admins
+# =========================
+def startup_dump():
+    lines = [
+        "===== SLH Admin Bot – Startup =====",
+        f"MODE: {MODE}",
+        f"API: {API}",
+        f"PUBLIC: {PUBLIC}",
+        f"PATH: {PATH}",
+        f"PORT: {PORT}",
+        f"SECRET(valid): {bool(re.fullmatch(r'[A-Za-z0-9_\\-]+', SECRET))}",
+        f"ADMINS: {'|'.join(map(str, ADMINS)) if ADMINS else '(unset -> allow self)'}",
+        f"DEFAULT_WALLET: {DEFAULT_WALLET or '-'}",
+        f"DEFAULT_META_CID: {DEFAULT_META_CID or '-'}",
+        f"SELA_AMOUNT: {SELA_AMOUNT}",
+        f"TOKEN(masked): {_mask_token(TOKEN)}",
+        f"LOG_DIR: {LOG_DIR}",
+    ]
+    for ln in lines: log.info(ln)
+    write_log_line("\n".join(lines))
+
+# =========================
+# Webhook ensure (+ tools)
+# =========================
+async def ensure_webhook() -> Tuple[bool, str]:
+    """Delete + set webhook, then fetch getWebhookInfo and summarize."""
+    if not PUBLIC.startswith("https://"):
+        return False, "BOT_WEBHOOK_PUBLIC_BASE must be https for webhook mode"
+    url = PUBLIC + PATH
+    try:
+        async with httpx.AsyncClient(timeout=20) as cx:
+            delete = (await cx.post(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook")).json()
+            set_    = (await cx.post(f"https://api.telegram.org/bot{TOKEN}/setWebhook",
+                                     data={"url": url, "secret_token": SECRET})).json()
+            info    = (await cx.get (f"https://api.telegram.org/bot{TOKEN}/getWebhookInfo")).json()
+        log.info("ensure_webhook: ok=True")
+        log.info(f"url={url}")
+        log.info(f"delete={delete}")
+        log.info(f"set={set_}")
+        log.info(f"info={info}")
+        write_log_line(block_header("ensure_webhook"))
+        write_log_line(json.dumps({"url": url, "delete": delete, "set": set_, "info": info}, ensure_ascii=False))
+        return True, "ok"
+    except Exception as e:
+        log.error(f"ensure_webhook failed: {e}")
+        return False, str(e)
+
+def _ensure_main_loop():
+    """
+    Python 3.12 + PTB 20.8: לעיתים אין event loop ב־MainThread.
+    ניצור אחד כדי למנוע RuntimeError.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+# =========================
+# Guided state for /adm_sell wizard
+# =========================
+WIZ_SELL: Dict[int, Dict[str, str]] = {}
+
+def reset_wiz(user_id: int):
+    if user_id in WIZ_SELL:
+        del WIZ_SELL[user_id]
+
+# =========================
+# Handlers
+# =========================
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        kb = [
+            [InlineKeyboardButton("⚡ קנה/י SELA (NFT)", callback_data="buy_sela_nft"),
+             InlineKeyboardButton("🚀 הנפקה/מכירה", callback_data="sell_wizard")],
+            [InlineKeyboardButton("📊 סטטוס", callback_data="status"),
+             InlineKeyboardButton("ℹ️ עזרה", callback_data="help")]
+        ]
+        text = (
+            "ברוך/ה הבא/ה ל־<b>SLH Admin Bot</b> ✨\n"
+            "כאן מבצעים mint ל־NFT (ERC-721) בלחיצה.\n\n"
+            "בחר/י פעולה:"
+        )
+        msg = update.message or update.effective_message
+        await msg.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.exception("start_cmd failed: %s", e)
+        await (update.message or update.effective_message).reply_text(f"❗ שגיאה: {e}")
+
+async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("pong ✅")
+
+async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """בדיקת בריאות נגד ה-API /healthz + סיכום קצר."""
+    try:
+        h = await api_get("/healthz")
+        ok = h.get("ok")
+        net = h.get("network","?")
+        contract = h.get("contract","?")
+        await update.message.reply_text(
+            f"healthz: ok={ok} | network={net} | contract={contract}"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"healthz error: {e}")
+
+async def adm_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    txt = (
+        "*פקודות אדמין שימושיות:*\n"
+        "/adm_status — מצב ריצה והגדרות\n"
+        "/adm_setwebhook — קובע webhook לפי ההגדרות הנוכחיות\n"
+        "/adm_recent [N] — האירועים האחרונים | אפשר גם `save` לשמירה לקובץ\n"
+        "/adm_sell `<wallet> <ipfs://CID|https://...> [note]` — מהיר\n"
+        "/adm_sell — ללא פרמטרים: אשף דו־שלבי + אישור\n"
+        "/adm_echo <טקסט> — החזר טקסט (בדיקה)\n"
+        "/ping — בדיקת חיים\n"
+        "/health — בדיקת /healthz של ה־API\n"
+    )
+    await update.message.reply_markdown(txt)
+
+async def adm_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    info = (
+        "Status:\n\n"
+        f"MODE={MODE} | PORT={PORT} | PUBLIC='{PUBLIC}' | PATH='{PATH}' | SECRET.len={len(SECRET)} | API='{API}'\n"
+        f"DEFAULT_WALLET={DEFAULT_WALLET or '-'} | DEFAULT_META_CID={DEFAULT_META_CID or '-'} | SELA_AMOUNT={SELA_AMOUNT}\n"
+        f"LOG_DIR={LOG_DIR}\n"
+        f"SESSION_LOG={os.path.basename(SESSION_LOG_FILE)}"
+    )
+    await update.message.reply_text(info)
+
+async def adm_setwebhook(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    ok, msg = await ensure_webhook()
+    await update.message.reply_text(f"SetWebhook → {ok}\n{PUBLIC}{PATH}")
+
+async def adm_echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    text = " ".join(context.args) if context.args else "(no text)"
+    await update.message.reply_text(f"echo: {text}")
+
+async def adm_recent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    # special: /adm_recent save → force save block file
+    if context.args and context.args[0].lower() == "save":
+        # פשוט מצביע על קובץ הסשן הנוכחי
+        await update.message.reply_text(f"Saved to file: {os.path.basename(SESSION_LOG_FILE)}")
+        return
+
+    n = 20
+    if context.args and context.args[0].isdigit():
+        n = min(int(context.args[0]), 120)
+    if not EVENTS:
+        await update.message.reply_text("No events yet.")
+        return
+    lines = [block_header(f"RECENT last {n}")]
+    for ev in EVENTS[-n:]:
+        lines.append(
+            f"ts={ev.get('ts')} | type={ev.get('type','-')} | wallet={ev.get('wallet','-')}\n"
+            f"tokenURI={ev.get('token_uri','-')} | mint={ev.get('mint_tx','-')} | sela={ev.get('sela_tx','-')} | note={ev.get('note','-')}"
+        )
+    txt = "```\n" + ("\n\n".join(lines)) + "\n```"
+    await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
+
+# ---------- /mint (לכל המשתמשים) ----------
+async def mint_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User-facing mint: /mint <wallet> — uses DEFAULT_META_CID for token_uri, then grant SELA."""
+    if not context.args:
+        await update.message.reply_markdown(
+            "שימוש: `/mint <כתובת־ארנק>`\nדוגמה: `/mint 0x1234...abcd`"
+        )
+        return
+
+    wallet = context.args[0].strip()
+    if not re.fullmatch(r"0x[a-fA-F0-9]{40}", wallet):
+        await update.message.reply_text("כתובת ארנק לא תקינה (צורה: 0x… 40 hex).")
+        return
+
+    if not DEFAULT_META_CID:
+        await update.message.reply_text("Default CID לא מוגדר בשרת (DEFAULT_META_CID). פנה לאדמין.")
+        return
+
+    token_uri = f"ipfs://{DEFAULT_META_CID}"
+    try:
+        # Mint
+        mint_res = await api_post("/v1/chain/mint-demo", {
+            "to_wallet": wallet,
+            "token_uri": token_uri
+        })
+        mint_tx = mint_res.get("tx") or mint_res.get("hash") or "-"
+
+        # Grant SELA
+        grant_res = await api_post("/v1/chain/grant-sela", {
+            "to_wallet": wallet,
+            "amount": str(SELA_AMOUNT)
+        })
+        sela_tx = grant_res.get("tx") or grant_res.get("hash") or "-"
+
+        push_event({
+            "type": "mint_user",
+            "wallet": wallet,
+            "token_uri": token_uri,
+            "mint_tx": mint_tx,
+            "sela_tx": sela_tx,
+            "note": "user /mint"
+        })
+
+        links = []
+        if re.fullmatch(r"0x[0-9a-fA-F]{64}", mint_tx):
+            links.append(f"[Mint TX](https://testnet.bscscan.com/tx/{mint_tx})")
+        if re.fullmatch(r"0x[0-9a-fA-F]{64}", sela_tx):
+            links.append(f"[SELA TX](https://testnet.bscscan.com/tx/{sela_tx})")
+        links_str = " | ".join(links) if links else "(לינקים יופיעו לאחר כרייה)"
+
+        msg = (
+            "✅ *הונפק לך NFT והועבר SELA!*\n"
+            f"• Wallet: `{wallet}`\n"
+            f"• tokenURI: `{token_uri}`\n"
+            f"• {links_str}\n"
+        )
+        await update.message.reply_markdown(msg, disable_web_page_preview=True)
+
+    except httpx.HTTPError as e:
+        await update.message.reply_text(f"API error: {e}")
+    except Exception as e:
+        await update.message.reply_text(f"Unexpected: {e}")
+
+# ---------- /adm_sell (מהיר או אשף) ----------
+async def adm_sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+
+    uid = update.effective_user.id
+
+    # מצב מהיר עם ארגומנטים
+    if len(context.args) >= 2:
+        wallet = context.args[0].strip()
+        uri_in  = context.args[1].strip()
+        note    = " ".join(context.args[2:]).strip() if len(context.args) > 2 else ""
+        await _exec_sell(update, wallet, uri_in, note)
+        return
+
+    # אשף דו-שלבי
+    WIZ_SELL[uid] = {"step": "wallet"}
+    await update.message.reply_text(
+        "אשף הנפקה למכירה 🚀\n"
+        "שלב 1/2 — שלח/י את כתובת הארנק (0x…):"
+    )
+
+async def _exec_sell(update: Update, wallet: str, uri_in: str, note: str):
+    # Normalize token_uri
+    if uri_in.startswith("ipfs://"):
+        token_uri = uri_in
+    elif re.match(r"^Qm[1-9A-Za-z]{44,}", uri_in):
+        token_uri = f"ipfs://{uri_in}"
+    else:
+        token_uri = uri_in  # allow https
+
+    # Validate wallet
+    if not re.fullmatch(r"0x[a-fA-F0-9]{40}", wallet):
+        await update.message.reply_text("כתובת ארנק לא תקינה (צורה: 0x… 40 hex).")
+        return
+
+    try:
+        # 1) Mint
+        mint_res = await api_post("/v1/chain/mint-demo", {
+            "to_wallet": wallet,
+            "token_uri": token_uri
+        })
+        mint_tx = mint_res.get("tx") or mint_res.get("hash") or "-"
+
+        # 2) Grant SELA
+        sela_amt = SELA_AMOUNT
+        grant_res = await api_post("/v1/chain/grant-sela", {
+            "to_wallet": wallet,
+            "amount": str(sela_amt)
+        })
+        sela_tx = grant_res.get("tx") or grant_res.get("hash") or "-"
+
+        push_event({
+            "type": "adm_sell",
+            "wallet": wallet,
+            "token_uri": token_uri,
+            "mint_tx": mint_tx,
+            "sela_tx": sela_tx,
+            "note": note
+        })
+
+        links = []
+        if re.fullmatch(r"0x[0-9a-fA-F]{64}", mint_tx):
+            links.append(f"[Mint TX](https://testnet.bscscan.com/tx/{mint_tx})")
+        if re.fullmatch(r"0x[0-9a-fA-F]{64}", sela_tx):
+            links.append(f"[SELA TX](https://testnet.bscscan.com/tx/{sela_tx})")
+        links_str = " | ".join(links) if links else "(לינקים יופיעו לאחר כרייה)"
+
+        msg = (
+            "✅ *Sold + Granted*\n"
+            f"• Wallet: `{wallet}`\n"
+            f"• tokenURI: `{token_uri}`\n"
+            f"• {links_str}\n"
+        )
+        await update.message.reply_markdown(msg, disable_web_page_preview=True)
+
+    except httpx.HTTPError as e:
+        await update.message.reply_text(f"API error: {e}")
+    except Exception as e:
+        await update.message.reply_text(f"Unexpected: {e}")
+
+async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Router לפלואו אשף /adm_sell + fallback פקודות לא מוכרות."""
+    if not update.message or not update.message.text:
+        return
+
+    txt = update.message.text.strip()
+    uid = update.effective_user.id
+
+    # אשף מכירה לאדמין
+    if uid in WIZ_SELL:
+        st = WIZ_SELL[uid]
+        step = st.get("step")
+
+        if step == "wallet":
+            if not re.fullmatch(r"0x[a-fA-F0-9]{40}", txt):
+                await update.message.reply_text("כתובת ארנק לא תקינה. נסה שוב (0x… 40 hex).")
+                return
+            st["wallet"] = txt
+            st["step"] = "uri"
+            await update.message.reply_text(
+                "שלב 2/2 — שלח/י את ה־tokenURI:\n"
+                "• `ipfs://<CID>` (מומלץ)\n"
+                "• או `https://...` קובץ מטאדטה תקין\n"
+                "• או רק CID (נתרגם ל-ipfs://CID)\n",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+
+        if step == "uri":
+            uri_in = txt
+            if uri_in.startswith("ipfs://"):
+                token_uri = uri_in
+            elif re.match(r"^Qm[1-9A-Za-z]{44,}", uri_in):
+                token_uri = f"ipfs://{uri_in}"
+            else:
+                token_uri = uri_in
+            st["token_uri"] = token_uri
+            st["step"] = "confirm"
+            echo = (
+                "*אישור נתונים:*\n"
+                f"Wallet: `{st['wallet']}`\n"
+                f"tokenURI: `{st['token_uri']}`\n\n"
+                "כתבו: `confirm` כדי לבצע / `cancel` לביטול.\n"
+                "(אפשר גם לצרף הערה אחרי confirm, למשל: `confirm לקוח דמו`)\n"
+            )
+            await update.message.reply_markdown(echo)
+            return
+
+        if step == "confirm":
+            low = txt.lower()
+            if low.startswith("cancel"):
+                reset_wiz(uid)
+                await update.message.reply_text("בוטל.")
+                return
+            if low.startswith("confirm"):
+                note = txt[len("confirm"):].strip()
+                wallet = st["wallet"]; token_uri = st["token_uri"]
+                reset_wiz(uid)
+                # בצע
+                await _exec_sell(update, wallet, token_uri, note)
+                return
+
+    # fallback — אם טקסט מתחיל ב־/ והפקודה לא מוכרת
+    if txt.startswith("/"):
+        await update.message.reply_text("Unknown command. נסה /adm_help או /mint")
+
+# =========================
+# App & Run
+# =========================
+def build_app():
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("ping",  ping_cmd))
+    app.add_handler(CommandHandler("health",  health_cmd))
+
+    app.add_handler(CommandHandler("adm_help", adm_help))
+    app.add_handler(CommandHandler("adm_status", adm_status))
+    app.add_handler(CommandHandler("adm_setwebhook", adm_setwebhook))
+    app.add_handler(CommandHandler("adm_recent", adm_recent))
+    app.add_handler(CommandHandler("adm_sell", adm_sell))
+    app.add_handler(CommandHandler("adm_echo", adm_echo))
+    # wizard + fallback
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_router))
+    # generic fallback for anything else
+    app.add_handler(CallbackQueryHandler(on_cb))
+    app.add_handler(CommandHandler('mint', mint_nft_start))
+    app.add_handler(CommandHandler('tokenId', cmd_tokenId))
+    app.add_handler(CommandHandler('tokenURI', cmd_tokenURI))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, mint_nft_wallet_collector))
+
+    return app
+
+def run_polling(app):
+    log.info("Starting bot in POLLING mode…")
+    app.run_polling(close_loop=False)
+
+def run_webhook(app):
+    if not PUBLIC.startswith("https://"):
+        print("BOT_WEBHOOK_PUBLIC_BASE must be https for webhook mode")
+        sys.exit(1)
+    url = PUBLIC + PATH
+    log.info(f"Starting bot in WEBHOOK mode at {url} (port {PORT})")
+    _ensure_main_loop()
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        webhook_url=url,
+        secret_token=SECRET,
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+        close_loop=False,
+        cert=None, key=None
+    )
+
+if __name__ == "__main__":
+    startup_dump()
+
+    # וובהוק ברמת פרה-פלייט (לא פוסל דיפלוי אם נכשל — תהיה פולינג)
+    if MODE == "webhook":
+        try:
+            ok, msg = asyncio.run(ensure_webhook())
+            if not ok:
+                log.error(f"ensure_webhook FAILED: {msg}")
+        except Exception as e:
+            log.error(f"ensure_webhook crashed: {e}")
+
+    print(f"🚀 Admin bot is starting ({MODE})…")
+    app = build_app()
+
+    try:
+        if MODE == "polling":
+            run_polling(app)
+        else:
+            run_webhook(app)
+    except RuntimeError as e:
+        # ⛑️ safety net — אם יש בעיית לולאה, עבור לפולינג כדי לא לאבד זמינות
+        log.error(f"Webhook failed ({e}). Falling back to POLLING mode…")
+        run_polling(app)
+
+ERC20_ABI = [
+    {"constant": False, "inputs": [{"name": "to", "type": "address"}, {"name": "value", "type": "uint256"}], "name": "transfer", "outputs": [{"name":"","type":"bool"}], "type": "function"},
+    {"constant": True,  "inputs": [], "name": "decimals", "outputs": [{"name":"","type":"uint8"}], "type": "function"},
+    {"constant": True,  "inputs": [], "name": "symbol", "outputs": [{"name":"","type":"string"}], "type": "function"},
+]
+def _env(k, d=None): return os.environ.get(k, d)
+def _get_required(k):
+    v = _env(k)
+    if not v: raise RuntimeError(f"Missing env: {k}")
+    return v
+
+async def mint_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["awaiting_wallet_for_mint"] = True
+    await (update.message or update.effective_message).reply_text(
+        "שלח/י כתובת ארנק BSC (0x…) לקבלת SELA (טסטנט)."
+    )
+
+async def mint_wallet_collector(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("awaiting_wallet_for_mint"):
+        return
+    addr = (update.message.text or "").strip()
+    if not addr.startswith("0x") or len(addr) != 42:
+        await update.message.reply_text("❗ כתובת לא תקינה. נא שלח/י כתובת בפורמט 0x...")
+        return
+    context.user_data["awaiting_wallet_for_mint"] = False
+    await update.message.reply_text("⏳ מבצע טרנזקציה על BSC Testnet…")
+
+    loop = asyncio.get_running_loop()
+    try:
+        tx_hash, symbol, amount = await loop.run_in_executor(None, erc20_transfer_from_treasury, addr)
+        await update.message.reply_text(f"✅ נשלח {amount} {symbol} לכתובת:\n<code>{addr}</code>\nTx: <code>{tx_hash}</code>", parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await update.message.reply_text(f"❗ שגיאה בביצוע:\n{e}")
+
+def erc20_transfer_from_treasury(to_addr: str):
+    rpc = _get_required("BSC_RPC_URL")
+    chain_id = int(_env("CHAIN_ID", "97"))
+    contract_addr = _get_required("TOKEN_CONTRACT")
+    pk = _get_required("TREASURY_PRIVATE_KEY")
+    amount_str = _get_required("SELA_AMOUNT")
+
+    w3 = Web3(Web3.HTTPProvider(rpc))
+    if not w3.is_connected(): raise RuntimeError("RPC לא זמין")
+    acct = w3.eth.account.from_key(pk)
+    contract = w3.eth.contract(address=Web3.to_checksum_address(contract_addr), abi=ERC20_ABI)
+
+    decimals = contract.functions.decimals().call()
+    symbol = contract.functions.symbol().call()
+    value = int(float(amount_str) * (10 ** decimals))
+
+    nonce = w3.eth.get_transaction_count(acct.address)
+    tx = contract.functions.transfer(Web3.to_checksum_address(to_addr), value).build_transaction({
+        "from": acct.address,
+        "nonce": nonce,
+        "chainId": chain_id,
+        "gas": 100000,
+        "maxFeePerGas": w3.to_wei("2", "gwei"),
+        "maxPriorityFeePerGas": w3.to_wei("1", "gwei"),
+    })
+    signed = acct.sign_transaction(tx)
+    tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+    if receipt.status != 1:
+        raise RuntimeError(f"tx failed: {tx_hash.hex()}")
+    return (tx_hash.hex(), symbol, amount_str)
+
+async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    data = (q.data or "").strip()
+    await q.answer()
+    if data == "buy_sela":
+        await mint_start(update, context)
+    elif data == "sell_wizard":
+        await adm_sell(update, context)
+    elif data == "status":
+        await adm_status(update, context)
+    elif data == "help":
+        await adm_help(update, context)
+    else:
+        await q.message.reply_text("⌛ בקרוב…")
+
+def _env(k, d=None): return os.environ.get(k, d)
+def _get_required(k):
+    v = _env(k)
+    if not v: raise RuntimeError(f"Missing env: {k}")
+    return v
+
+def _erc721_mint_abi():
+    fn = os.environ.get("TOKEN_MINT_FN", "safeMint")
+    return [{
+        "inputs": [{"internalType":"address","name":"to","type":"address"}],
+        "name": fn,
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    }]
+
+async def mint_nft_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["awaiting_wallet_for_mint_nft"] = True
+    await (update.message or update.effective_message).reply_text(
+        "שלח/י כתובת ארנק BSC (0x…) לקבלת NFT (טסטנט)."
+    )
+
+async def mint_nft_wallet_collector(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("awaiting_wallet_for_mint_nft"):
+        return
+    addr = (update.message.text or "").strip()
+    if not addr.startswith("0x") or len(addr) != 42:
+        await update.message.reply_text("❗ כתובת לא תקינה. נא שלח/י כתובת בפורמט 0x...")
+        return
+    context.user_data["awaiting_wallet_for_mint_nft"] = False
+
+    logger.info("[MINT] start | to=%s", addr)
+    await update.message.reply_text("⏳ מבצע mint ל-NFT על BSC Testnet…")
+
+    loop = asyncio.get_running_loop()
+    try:
+        tx_hash = await loop.run_in_executor(None, erc721_mint_from_treasury, addr)
+        context.user_data["last_mint_tx"] = tx_hash
+        logger.info("[MINT] sent | tx=%s", tx_hash)
+
+        try:
+            rpc = _get_required("BSC_RPC_URL")
+            contract_addr = _get_required("NFT_CONTRACT")
+            w3 = Web3(Web3.HTTPProvider(rpc))
+            if w3.is_connected():
+                tid = _fetch_token_id_from_receipt(w3, contract_addr, tx_hash)
+                logger.info("[MINT] receipt parsed | tokenId=%s", tid)
+                if tid is not None:
+                    context.user_data["last_token_id"] = tid
+                    await update.message.reply_text(
+                        f"✅ NFT הונפק!\nTokenID: <code>{tid}</code>\nTx: <code>{tx_hash}</code>",
+                        parse_mode=ParseMode.HTML
+                    )
+                else:
+                    await update.message.reply_text(
+                        f"✅ NFT הונפק!\n(לא אותר tokenId מהקבלה)\nTx: <code>{tx_hash}</code>",
+                        parse_mode=ParseMode.HTML
+                    )
+            else:
+                logger.warning("[MINT] RPC not connected for receipt parse")
+                await update.message.reply_text(
+                    f"✅ NFT הונפק!\n(אין חיבור RPC לזיהוי tokenId כעת)\nTx: <code>{tx_hash}</code>",
+                    parse_mode=ParseMode.HTML
+                )
+        except Exception as ie:
+            logger.exception("[MINT] parse receipt failed: %s", ie)
+            await update.message.reply_text(
+                f"✅ NFT הונפק!\n(שחזור tokenId נדחה: {ie})\nTx: <code>{tx_hash}</code>",
+                parse_mode=ParseMode.HTML
+            )
+    except Exception as e:
+        logger.exception("[MINT] failed: %s", e)
+        await update.message.reply_text(f"❗ שגיאה בביצוע:\n{e}")
+
+def erc721_mint_from_treasury(to_addr: str) -> str:
+    rpc = _get_required("BSC_RPC_URL")
+    chain_id = int(_env("CHAIN_ID", "97"))
+    contract_addr = _get_required("NFT_CONTRACT")
+    pk = _get_required("TREASURY_PRIVATE_KEY")
+
+    logger.info("[TX] prepare | rpc=%s | chain_id=%s | contract=%s", rpc, chain_id, contract_addr)
+    w3 = Web3(Web3.HTTPProvider(rpc))
+    if not w3.is_connected():
+        raise RuntimeError("RPC לא זמין")
+
+    acct = w3.eth.account.from_key(pk)
+    logger.debug("[TX] from address=%s", acct.address)
+
+    abi = _erc721_mint_abi()
+    contract = w3.eth.contract(address=Web3.to_checksum_address(contract_addr), abi=abi)
+    fn = contract.get_function_by_name("safeMint")(Web3.to_checksum_address(to_addr))
+
+    nonce = w3.eth.get_transaction_count(acct.address)
+    logger.debug("[TX] nonce=%s", nonce)
+
+    tx = fn.build_transaction({
+        "from": acct.address,
+        "nonce": nonce,
+        "chainId": chain_id,
+        "gas": 200000,
+        "maxFeePerGas": w3.to_wei("2", "gwei"),
+        "maxPriorityFeePerGas": w3.to_wei("1", "gwei"),
+    })
+    try:
+        dump = {k: (v.hex() if hasattr(v,'hex') else (str(v) if (k -ne 'data' and k -ne 'input') else '<bytecode>')) for k,v in tx.items()}
+    except:
+        dump = {k: (str(v)) for k,v in tx.items()}
+    logger.debug("[TX] built | %s", json.dumps(dump, ensure_ascii=False))
+
+    signed = acct.sign_transaction(tx)
+    tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
+    logger.info("[TX] sent | hash=%s", tx_hash.hex())
+
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+    logger.info("[TX] mined | status=%s", getattr(receipt,'status',None))
+    if receipt.status != 1:
+        raise RuntimeError(f"tx failed: {tx_hash.hex()}")
+    return tx_hash.hex()
+
+async def cmd_tokenId(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tid = context.user_data.get("last_token_id")
+    if tid is not None:
+        await update.message.reply_text(f"🔖 tokenId האחרון שלך: <code>{tid}</code>", parse_mode=ParseMode.HTML)
+        return
+    txh = context.user_data.get("last_mint_tx")
+    if not txh:
+        await update.message.reply_text("אין tokenId שמור עדיין. בצע/י mint קודם.")
+        return
+    try:
+        rpc = _get_required("BSC_RPC_URL")
+        contract_addr = _get_required("TOKEN_CONTRACT")
+        w3 = Web3(Web3.HTTPProvider(rpc))
+        if not w3.is_connected():
+            await update.message.reply_text("RPC לא זמין כרגע לשחזור tokenId.")
+            return
+        tid = _fetch_token_id_from_receipt(w3, contract_addr, txh)
+        if tid is None:
+            await update.message.reply_text("לא אותר tokenId מהקבלה. ייתכן והחוזה לא סטנדרטי או שהאירוע שונה.")
+            return
+        context.user_data["last_token_id"] = tid
+        await update.message.reply_text(f"🔖 tokenId האחרון שלך: <code>{tid}</code>", parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await update.message.reply_text(f"שגיאה בשחזור tokenId: {e}")
+
+async def cmd_tokenURI(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tid = context.user_data.get("last_token_id")
+    if tid is None:
+        await update.message.reply_text("אין tokenId שמור. הרץ/י /tokenId קודם, או בצע/י mint.")
+        return
+    try:
+        w3, c = _get_w3_and_contract_for_tokenuri()
+        fn_name = os.environ.get("TOKEN_URI_FN", "tokenURI")
+        fn = c.get_function_by_name(fn_name)(tid)
+        uri = fn.call()
+        await update.message.reply_text(f"🔗 tokenURI:\n<code>{uri}</code>", parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await update.message.reply_text(f"שגיאה בקריאת tokenURI: {e}")
+
+def _env(k, d=None): return os.environ.get(k, d)
+def _get_required(k):
+    v = _env(k)
+    if not v: raise RuntimeError(f"Missing env: {k}")
+    return v
+
+def _erc721_mint_abi():
+    # safeMint(address to)
+    return [{
+        "inputs": [{"internalType":"address","name":"to","type":"address"}],
+        "name": "safeMint",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    }]
+
+def _erc721_tokenuri_abi():
+    # tokenURI(uint256) -> string
+    return [{
+        "inputs": [{"internalType":"uint256","name":"tokenId","type":"uint256"}],
+        "name": "tokenURI",
+        "outputs": [{"internalType":"string","name":"","type":"string"}],
+        "stateMutability": "view",
+        "type": "function"
+    }]
+
+def _fetch_token_id_from_receipt(w3: Web3, contract_address: str, tx_hash_hex: str):
+    sig = Web3.keccak(text="Transfer(address,address,uint256)").hex()
+    receipt = w3.eth.get_transaction_receipt(tx_hash_hex)
+    for lg in receipt.logs:
+        if lg["address"].lower() == Web3.to_checksum_address(contract_address).lower() and lg["topics"][0].hex().lower() == sig.lower():
+            if len(lg["topics"]) >= 4:
+                return int(lg["topics"][3].hex(), 16)
+    return None
+
+def _get_w3_and_contract_for_tokenuri():
+    rpc = _get_required("BSC_RPC_URL")
+    contract_addr = _get_required("NFT_CONTRACT")
+    w3 = Web3(Web3.HTTPProvider(rpc))
+    if not w3.is_connected(): raise RuntimeError("RPC לא זמין")
+    abi = _erc721_tokenuri_abi()
+    c = w3.eth.contract(address=Web3.to_checksum_address(contract_addr), abi=abi)
+    return w3, c
