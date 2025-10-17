@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+requests
+web3>=6
+eth-account
+pydantic>=2
+python-telegram-bot[webhooks]
