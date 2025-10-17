@@ -1,13 +1,6 @@
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
-
-    $line=$args[0].Groups[1].Value
-    $parts = ($line -split '\s*,\s*') + @()
-    foreach($p in @('CallbackQueryHandler','MessageHandler','CommandHandler','filters')){
-      if ($parts -notcontains $p){ $parts += $p }
-    }
-    'from telegram.ext import ' + (($parts | Select-Object -Unique) -join ', ')
-  
+from telegram.ext import CallbackQueryHandler, MessageHandler, filters
 from web3 import Web3
 import os, asyncio
 # -*- coding: utf-8 -*-
@@ -17,14 +10,7 @@ import httpx
 
 from telegram import Update
 from telegram.constants import ParseMode
-
-    $line=$args[0].Groups[1].Value
-    $parts = ($line -split '\s*,\s*') + @()
-    foreach($p in @('CallbackQueryHandler','MessageHandler','CommandHandler','filters')){
-      if ($parts -notcontains $p){ $parts += $p }
-    }
-    'from telegram.ext import ' + (($parts | Select-Object -Unique) -join ', ')
-  
+from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
@@ -525,7 +511,7 @@ def build_app():
     app.add_handler(CommandHandler("adm_echo", adm_echo))
     # wizard + fallback
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_router))
-    # generic fallback for anything else
+    # generic fallback for anything else
     app.add_handler(CallbackQueryHandler(on_cb))
     app.add_handler(CommandHandler('mint', mint_nft_start))
     app.add_handler(CommandHandler('tokenId', cmd_tokenId))
@@ -702,6 +688,7 @@ async def mint_nft_wallet_collector(update: Update, context: ContextTypes.DEFAUL
         context.user_data["last_mint_tx"] = tx_hash
         logger.info("[MINT] sent | tx=%s", tx_hash)
 
+        # נסה להוציא tokenId מהקבלה
         try:
             rpc = _get_required("BSC_RPC_URL")
             contract_addr = _get_required("NFT_CONTRACT")
@@ -765,11 +752,7 @@ def erc721_mint_from_treasury(to_addr: str) -> str:
         "maxFeePerGas": w3.to_wei("2", "gwei"),
         "maxPriorityFeePerGas": w3.to_wei("1", "gwei"),
     })
-    try:
-        dump = {k: (v.hex() if hasattr(v,'hex') else (str(v) if (k -ne 'data' and k -ne 'input') else '<bytecode>')) for k,v in tx.items()}
-    except:
-        dump = {k: (str(v)) for k,v in tx.items()}
-    logger.debug("[TX] built | %s", json.dumps(dump, ensure_ascii=False))
+    logger.debug("[TX] built | %s", json.dumps({k: (str(v) if hasattr(v,'hex') else v) for k,v in tx.items()}, ensure_ascii=False))
 
     signed = acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
