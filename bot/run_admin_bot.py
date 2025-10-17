@@ -253,7 +253,6 @@ async def adm_recent(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     # special: /adm_recent save → force save block file
     if context.args and context.args[0].lower() == "save":
-        # פשוט מצביע על קובץ הסשן הנוכחי
         await update.message.reply_text(f"Saved to file: {os.path.basename(SESSION_LOG_FILE)}")
         return
 
